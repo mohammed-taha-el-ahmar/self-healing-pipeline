@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  PYTHONPATH: ${{ github.workspace }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Ruff lint
+        run: uv run ruff check plugins dags tests
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Run unit tests (quality gate, no Airflow/Postgres needed)
+        run: uv run pytest tests/ -v
+
+  dag-validation:
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Validate DAG import (catches syntax errors, broken imports, cycle errors)
+        env:
+          AIRFLOW_HOME: /tmp/airflow_home
+          AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+          AIRFLOW__CORE__DAGS_FOLDER: ${{ github.workspace }}/dags
+          AIRFLOW__CORE__PLUGINS_FOLDER: ${{ github.workspace }}/plugins
+        run: |
+          uv run airflow db migrate
+          uv run python - <<'EOF'
+          from airflow.models import DagBag
+
+          bag = DagBag(dag_folder="dags", include_examples=False)
+          if bag.import_errors:
+              for filename, error in bag.import_errors.items():
+                  print(f"Import error in {filename}:\n{error}")
+              raise SystemExit(1)
+
+          dag = bag.dags.get("self_healing_daily_pipeline")
+          if dag is None:
+              raise SystemExit("DAG 'self_healing_daily_pipeline' not found")
+
+          expected_tasks = {
+              "extract",
+              "validate",
+              "branch_on_quality",
+              "load_to_warehouse_task",
+              "quarantine_task",
+          }
+          actual_tasks = {t.task_id for t in dag.tasks}
+          missing = expected_tasks - actual_tasks
+          if missing:
+              raise SystemExit(f"Missing expected tasks: {missing}")
+
+          print(f"DAG OK: {len(dag.tasks)} tasks loaded with no import errors")
+          EOF
+
+  docker-compose-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate docker-compose.yml
+        run: docker compose -f docker-compose.yml config > /dev/null

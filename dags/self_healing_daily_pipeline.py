@@ -1,0 +1,207 @@
+"""
+self_healing_daily_pipeline
+============================
+
+Architecture
+------------
+Source API (Open-Meteo) -> Airflow DAG (extract -> validate -> load) ->
+Great Expectations data quality gate ->
+  - pass -> weather_observations (Postgres warehouse table)
+  - fail -> weather_quarantine (Postgres) + Slack alert
+
+--------------------------------------------------------------------------
+Key decisions
+--------------------------------------------------------------------------
+
+Airflow over cron
+  Needed dependency management (extract must finish before validate,
+  validate before load), automatic retries with backoff for transient
+  API/network failures, and the ability to backfill any historical date
+  on demand via `airflow dags backfill -s ... -e ...`.
+
+Quarantine on failure, not fail-fast
+  If the Great Expectations suite fails for a partition, that batch is
+  written to `weather_quarantine` (with the full validation report) and a
+  Slack alert is sent -- but the DAG run itself succeeds. The pipeline
+  does not halt, and every other date's data keeps flowing normally.
+  Bad batches are isolated for inspection, not allowed to silently land
+  in the warehouse table dashboards read from.
+
+Idempotent task design
+  Every task is keyed by `ds` (the logical date), never wall-clock time.
+  `load_to_warehouse` and `load_to_quarantine` both DELETE existing rows
+  for `partition_date` before inserting -- so re-running a date, or
+  backfilling a range, never creates duplicates and always reflects the
+  latest run's output. This is what makes backfills safe.
+
+--------------------------------------------------------------------------
+Stack
+--------------------------------------------------------------------------
+Apache Airflow, Python, Great Expectations, Postgres, Docker Compose.
+See docker-compose.yml for the full local stack (Airflow webserver +
+scheduler + Postgres metadata DB + Postgres warehouse DB).
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timedelta
+
+import pandas as pd
+from airflow.decorators import dag, task
+from airflow.models import Variable
+from airflow.operators.python import get_current_context
+from airflow.providers.slack.notifications.slack import send_slack_notification
+
+from plugins.alerts.slack_alerts import build_quarantine_alert_blocks
+from plugins.checks.quality_gate import ValidationReport, run_quality_gate
+from plugins.load.postgres_loader import (
+    clear_quarantine,
+    clear_warehouse,
+    load_to_quarantine,
+    load_to_warehouse,
+)
+from plugins.source.source_api import fetch_daily_observations
+
+logger = logging.getLogger(__name__)
+
+SLACK_CONN_ID = "slack_alerts"
+SLACK_CHANNEL = "#data-pipeline-alerts"
+
+
+def _dag_run_url(context) -> str:
+    try:
+        dag_run = context["dag_run"]
+        base_url = Variable.get("airflow_base_url", default_var="http://localhost:8080")
+        return f"{base_url}/dags/{dag_run.dag_id}/grid?dag_run_id={dag_run.run_id}"
+    except Exception:
+        return "http://localhost:8080"
+
+
+def _on_task_failure_alert(context):
+    """on_failure_callback: posts an actionable Slack message for any
+    unhandled task failure (e.g. the source API is unreachable after all
+    retries are exhausted)."""
+    from plugins.alerts.slack_alerts import build_task_failure_message
+
+    ti = context["task_instance"]
+    exception = str(context.get("exception", "unknown error"))
+    msg = build_task_failure_message(
+        partition_date=context["ds"],
+        task_id=ti.task_id,
+        exception=exception,
+        dag_run_url=_dag_run_url(context),
+    )
+    notifier = send_slack_notification(
+        slack_conn_id=SLACK_CONN_ID,
+        text=msg["blocks"][0]["text"]["text"],
+        channel=SLACK_CHANNEL,
+        blocks=msg["blocks"],
+    )
+    notifier(context=context)
+
+
+default_args = {
+    "owner": "data-eng",
+    "retries": 3,
+    "retry_delay": timedelta(minutes=2),
+    "retry_exponential_backoff": True,
+    "max_retry_delay": timedelta(minutes=15),
+    "on_failure_callback": _on_task_failure_alert,
+}
+
+
+@dag(
+    dag_id="self_healing_daily_pipeline",
+    description="Source API -> extract -> validate (GE) -> load to warehouse or quarantine",
+    schedule="0 6 * * *",
+    start_date=datetime(2026, 6, 1),
+    catchup=True,
+    max_active_runs=3,
+    default_args=default_args,
+    tags=["ingestion", "data-quality", "great-expectations", "postgres"],
+    doc_md=__doc__,
+)
+def self_healing_daily_pipeline():
+
+    @task
+    def extract(ds: str) -> str:
+        """Pull one day's hourly observations from the source API.
+
+        Idempotent: always requests the same fixed date range (`ds` to
+        `ds`) from the upstream API, so a re-fetch for the same partition
+        returns the same logical data (modulo the upstream provider
+        revising historical records, which is rare and itself a valid
+        re-run scenario).
+
+        Returns the data as JSON (records orientation) via XCom -- small
+        enough (24 rows/day) that no intermediate file storage is needed.
+        Network/API errors propagate so Airflow's retry+backoff applies.
+        """
+        df = fetch_daily_observations(ds)
+        logger.info("Fetched %d observation rows for %s", len(df), ds)
+        return df.to_json(orient="records", date_format="iso")
+
+    @task
+    def validate(raw_json: str, ds: str) -> dict:
+        """Run the Great Expectations suite and return the serialized
+        ValidationReport. Pure function of the input data + ds."""
+        df = pd.read_json(raw_json, orient="records")
+        report = run_quality_gate(df, partition_date=ds)
+        logger.info("Validation report for %s:\n%s", ds, report.summary())
+        return report.to_dict()
+
+    @task.branch
+    def branch_on_quality(report: dict) -> str:
+        return "load_to_warehouse" if report["success"] else "quarantine"
+
+    @task
+    def load_to_warehouse_task(raw_json: str, ds: str):
+        """Validation passed -> delete-then-insert this partition's rows
+        into weather_observations, and clear any stale quarantine entry
+        for the same date (in case this is a re-run that fixed a prior
+        failure)."""
+        df = pd.read_json(raw_json, orient="records")
+        n = load_to_warehouse(df, partition_date=ds)
+        clear_quarantine(partition_date=ds)
+        logger.info("Loaded %d rows for %s into weather_observations", n, ds)
+
+    @task
+    def quarantine_task(raw_json: str, report: dict, ds: str):
+        """Validation failed -> delete-then-insert this partition's rows
+        into weather_quarantine (with the validation report attached),
+        clear any stale warehouse rows for the same date, and alert Slack.
+
+        The DAG run succeeds even though the *data* was rejected -- other
+        dates' runs are unaffected."""
+        df = pd.read_json(raw_json, orient="records")
+        load_to_quarantine(df, partition_date=ds, validation_report=report)
+        clear_warehouse(partition_date=ds)
+
+        rebuilt = ValidationReport.from_dict(report)
+        context = get_current_context()
+        slack_msg = build_quarantine_alert_blocks(
+            partition_date=ds,
+            report=rebuilt,
+            dag_run_url=_dag_run_url(context),
+        )
+        notifier = send_slack_notification(
+            slack_conn_id=SLACK_CONN_ID,
+            text=slack_msg["blocks"][0]["text"]["text"],
+            channel=SLACK_CHANNEL,
+            blocks=slack_msg["blocks"],
+        )
+        notifier(context=context)
+        logger.info("Quarantined %d rows for %s", len(df), ds)
+
+    raw = extract(ds="{{ ds }}")
+    report = validate(raw, ds="{{ ds }}")
+    branch = branch_on_quality(report)
+
+    warehouse_t = load_to_warehouse_task(raw, ds="{{ ds }}")
+    quarantine_t = quarantine_task(raw, report, ds="{{ ds }}")
+
+    branch >> [warehouse_t, quarantine_t]
+
+
+self_healing_daily_pipeline()

@@ -1,0 +1,32 @@
+[project]
+name = "self-healing-pipeline"
+version = "0.1.0"
+description = "Self-healing daily data pipeline with Airflow + data quality gates"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "apache-airflow==2.9.3",
+    "apache-airflow-providers-slack==8.6.2",
+    "apache-airflow-providers-postgres==5.11.1",
+    "great-expectations==0.18.19",
+    "pandas==2.2.2",
+    "pyarrow==16.1.0",
+    "requests==2.32.3",
+    "sqlalchemy==1.4.52",
+    "psycopg2-binary==2.9.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.2.2",
+    "ruff==0.5.0",
+]
+
+[tool.ruff]
+line-length = 100
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["plugins"]
