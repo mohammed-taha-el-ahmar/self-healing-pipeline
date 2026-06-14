@@ -3,7 +3,7 @@
 A daily ingestion pipeline that catches bad data before it reaches
 dashboards — and tells you exactly what broke and why.
 
-![project worflow](https://raw.githubusercontent.com/mohammed-taha-el-ahmar/self-healing-pipeline/main/docs/img/workflow.png?raw=true)
+![project worflow](https://raw.githubusercontent.com/mohammed-taha-el-ahmar/self-healing-pipeline/main/docs/img/workflow.png)
 
 ## Architecture
 
