@@ -10,7 +10,7 @@ one source of truth for "what broke and why".
 
 from __future__ import annotations
 
-from plugins.checks.quality_gate import ValidationReport
+from checks.quality_gate import ValidationReport
 
 
 def build_quarantine_alert_blocks(

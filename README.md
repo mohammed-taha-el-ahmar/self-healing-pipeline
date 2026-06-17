@@ -5,6 +5,8 @@ dashboards — and tells you exactly what broke and why.
 
 ![project worflow](https://raw.githubusercontent.com/mohammed-taha-el-ahmar/self-healing-pipeline/main/docs/img/workflow.png)
 
+![project demo](https://raw.githubusercontent.com/mohammed-taha-el-ahmar/self-healing-pipeline/main/docs/img/demo-self-healing-pipeline.gif)
+
 ## Architecture
 
 ```
@@ -68,15 +70,24 @@ uv run pytest tests/
 ### 2. Full stack via Docker Compose
 
 ```bash
-# Airflow needs a writable UID for mounted volumes
+# On Linux: map your host UID so mounted volumes are writable
 echo "AIRFLOW_UID=$(id -u)" > .env
+
+# On macOS: use the container's built-in airflow user (see Troubleshooting)
+echo "AIRFLOW_UID=50000" > .env
 
 docker compose up airflow-init   # one-time DB migration + admin user
 docker compose up -d             # starts webserver, scheduler, both Postgres DBs
 ```
 
 - Airflow UI: http://localhost:8080 (admin/admin)
-- Warehouse Postgres: `psql -h localhost -p 5433 -U warehouse warehouse` (password: `warehouse`)
+- Warehouse Postgres (interactive session from inside the container):
+
+  ```bash
+  docker compose exec warehouse-db psql -U warehouse warehouse
+  ```
+
+  Or, if you have `psql` installed locally: `psql -h localhost -p 5433 -U warehouse warehouse` (password: `warehouse`)
 
 Configure the Slack connection (already stubbed via
 `AIRFLOW_CONN_SLACK_ALERTS` in `docker-compose.yml` — replace the bot
@@ -96,12 +107,12 @@ docker compose exec airflow-scheduler \
 
 Inspect results:
 
-```sql
--- Good days
-SELECT partition_date, count(*) FROM weather_observations GROUP BY 1 ORDER BY 1;
+```bash
+docker compose exec warehouse-db psql -U warehouse warehouse -c \
+  "SELECT partition_date, count(*) FROM weather_observations GROUP BY 1 ORDER BY 1;"
 
--- Quarantined days, with the GE report
-SELECT partition_date, validation_report FROM weather_quarantine;
+docker compose exec warehouse-db psql -U warehouse warehouse -c \
+  "SELECT partition_date, validation_report FROM weather_quarantine;"
 ```
 
 ## Key design decisions
@@ -177,3 +188,32 @@ each day's 24-row batch (see module docstring for full rationale):
 - `pressure_hpa` between 870 and 1085 hPa
 
 Any single failed expectation routes the whole batch to quarantine.
+
+## Troubleshooting
+
+### `uid not found: 501` on macOS
+
+```
+KeyError: 'getpwuid(): uid not found: 501'
+airflow.exceptions.AirflowConfigException: The user that Airflow is running
+as has no username; you must run Airflow as a full user …
+```
+
+**Cause:** `id -u` on macOS returns **501**, which has no matching entry
+in the Airflow container's `/etc/passwd`. The container crashes because
+Airflow requires a resolvable username.
+
+**Fix:** Use the container's built-in `airflow` user (UID 50000) instead:
+
+```bash
+echo "AIRFLOW_UID=50000" > .env
+docker compose down && docker compose up airflow-init
+```
+
+On macOS with Docker Desktop, bind-mount permissions are handled
+transparently by the VM layer, so using UID 50000 does not cause
+permission issues on the host `dags/`, `plugins/`, or `logs/` directories.
+
+On **Linux**, `echo "AIRFLOW_UID=$(id -u)" > .env` is correct — Linux
+UIDs (typically 1000+) are added to the container's `/etc/passwd` at
+runtime by the Airflow entrypoint.
