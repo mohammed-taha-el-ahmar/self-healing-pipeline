@@ -193,7 +193,7 @@ def run_quality_gate(df: pd.DataFrame, partition_date: str) -> ValidationReport:
     )
 
     r = ds.expect_column_values_to_be_between(
-        "temperature_c", min_value=-30, max_value=50, result_format="BASIC"
+        "temperature_c", min_value=-30, max_value=35, result_format="BASIC"
     )
     report.outcomes.append(_outcome_from_ge_result(r, "expect_column_values_to_be_between", "temperature_c"))
 

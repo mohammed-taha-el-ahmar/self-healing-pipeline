@@ -5,8 +5,6 @@ dashboards — and tells you exactly what broke and why.
 
 ![project worflow](https://raw.githubusercontent.com/mohammed-taha-el-ahmar/self-healing-pipeline/main/docs/img/workflow.png)
 
-![project demo](https://raw.githubusercontent.com/mohammed-taha-el-ahmar/self-healing-pipeline/main/docs/img/demo-self-healing-pipeline.gif)
-
 ## Architecture
 
 ```
@@ -38,6 +36,9 @@ weather_observations   weather_quarantine
   primary validation engine
 - **Warehouse:** Postgres, loaded via SQLAlchemy
 - **Alerting:** Slack (`apache-airflow-providers-slack`)
+- **Investigation agent:** Groq `llama-3.3-70b-versatile` via tool-calling
+  — automatically investigates quarantined batches and ships a structured
+  incident report
 - **Local stack:** Docker Compose (Airflow webserver + scheduler,
   Airflow metadata Postgres, warehouse Postgres)
 - **Dependency management:** [uv](https://docs.astral.sh/uv/)
@@ -46,16 +47,30 @@ weather_observations   weather_quarantine
 
 ```
 dags/
-  self_healing_daily_pipeline.py   # the DAG
+  self_healing_daily_pipeline.py   # the DAG (extract → validate → load → investigate)
 plugins/
   source/source_api.py             # Open-Meteo client (extract)
   checks/quality_gate.py           # Great Expectations suite + ValidationReport
   load/postgres_loader.py          # SQLAlchemy load to warehouse/quarantine tables
   alerts/slack_alerts.py           # Slack message builders
+agent/
+  config.py                        # AgentConfig (env-driven)
+  investigator.py                  # tool-calling loop → structured verdict
+  tools.py                         # 4 read-only evidence tools (quarantine, GE, logs, schema)
+  prompts.py                       # system prompt + JSON verdict schema
+  groq_client.py                   # thin Groq API wrapper
+  schema_baseline.json             # expected Open-Meteo field names
+  reporters/
+    markdown_reporter.py           # writes incident report to agent/reports/
+    slack_reporter.py              # posts verdict summary to Slack webhook
 tests/
-  test_quality_gate.py             # pure-python GE suite tests, no Airflow needed
+  test_quality_gate.py             # GE suite tests (no Airflow/DB needed)
+  test_agent_investigator.py       # agent loop tests (Groq + DB stubbed)
+  test_agent_tools.py              # evidence tool tests (DB stubbed)
+  test_agent_reporters.py          # reporter tests
 docker-compose.yml                 # Airflow + warehouse Postgres stack
 pyproject.toml                     # uv-managed dependencies
+docs/commands.md                   # useful CLI commands quick-reference
 ```
 
 ## Setup
@@ -71,10 +86,14 @@ uv run pytest tests/
 
 ```bash
 # On Linux: map your host UID so mounted volumes are writable
-echo "AIRFLOW_UID=$(id -u)" > .env
+echo "AIRFLOW_UID=$(id -u)" >> .env
 
 # On macOS: use the container's built-in airflow user (see Troubleshooting)
 echo "AIRFLOW_UID=50000" > .env
+
+# Optional: fill in agent credentials in .env to enable LLM investigation
+# GROQ_API_KEY=gsk_...
+# SLACK_WEBHOOK_URL=https://hooks.slack.com/...
 
 docker compose up airflow-init   # one-time DB migration + admin user
 docker compose up -d             # starts webserver, scheduler, both Postgres DBs
@@ -189,7 +208,37 @@ each day's 24-row batch (see module docstring for full rationale):
 
 Any single failed expectation routes the whole batch to quarantine.
 
-## Troubleshooting
+## Investigation agent
+
+When data is quarantined, `investigate_if_quarantined` fires automatically
+(via `trigger_rule="all_done"`) after every run. It runs a bounded
+tool-calling loop using Groq's `llama-3.3-70b-versatile` to gather evidence
+and return a structured verdict:
+
+```json
+{
+  "root_cause": "temperature_c threshold too tight: all 24 values exceeded max_value=20",
+  "confidence": "high",
+  "severity": "warning",
+  "evidence_summary": ["24/24 rows quarantined", "expect_column_values_to_be_between on temperature_c failed"],
+  "recommended_fix": "Review temperature_c threshold in quality_gate.py",
+  "requires_human": true
+}
+```
+
+The agent has four **read-only** tools: quarantine summary, GE validation
+results, Airflow task logs, and a schema column-null check. It diagnoses
+only — no pipeline state is ever mutated by the agent.
+
+The verdict is written to `agent/reports/<date>_self_healing_daily_pipeline_incident.md`
+and optionally posted to a Slack webhook.
+
+**To enable:** set `GROQ_API_KEY` in `.env`. `SLACK_WEBHOOK_URL` is
+optional. If `GROQ_API_KEY` is absent the task will fail gracefully.
+Clean runs (nothing quarantined) are skipped with `AirflowSkipException`
+so no LLM call is made.
+
+
 
 ### `uid not found: 501` on macOS
 

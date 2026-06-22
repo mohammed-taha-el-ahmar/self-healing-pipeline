@@ -9,9 +9,22 @@ x-airflow-common:
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'
     AIRFLOW__CORE__PLUGINS_FOLDER: /opt/airflow/plugins
+    # Make `agent/` importable alongside the existing `plugins/` package
+    PYTHONPATH: /opt/airflow
     AIRFLOW_CONN_SLACK_ALERTS: "slack://xoxb-your-bot-token@/#data-pipeline-alerts"
     # Warehouse DB the pipeline loads into (separate from Airflow's own metadata DB)
     WAREHOUSE_DB_URL: postgresql+psycopg2://warehouse:warehouse@warehouse-db:5432/warehouse
+    # --- Investigation agent ---
+    # GROQ_API_KEY and SLACK_WEBHOOK_URL are injected from .env (never hard-coded here)
+    GROQ_API_KEY: ${GROQ_API_KEY:-}
+    GROQ_MODEL: llama-3.3-70b-versatile
+    AGENT_MAX_TOOL_ITERATIONS: "6"
+    # psycopg2-native DSN for the warehouse (agent uses psycopg2 directly, not SQLAlchemy)
+    PIPELINE_POSTGRES_DSN: postgresql://warehouse:warehouse@warehouse-db:5432/warehouse
+    AIRFLOW_LOGS_DIR: /opt/airflow/logs
+    AGENT_REPORTS_DIR: /opt/airflow/agent/reports
+    SCHEMA_BASELINE_PATH: /opt/airflow/agent/schema_baseline.json
+    SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
     _PIP_ADDITIONAL_REQUIREMENTS: >-
       great-expectations==0.18.19
       requests==2.32.3
@@ -19,6 +32,7 @@ x-airflow-common:
     - ./dags:/opt/airflow/dags
     - ./plugins:/opt/airflow/plugins
     - ./logs:/opt/airflow/logs
+    - ./agent:/opt/airflow/agent
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
     &airflow-common-depends-on

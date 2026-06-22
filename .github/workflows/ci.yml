@@ -24,7 +24,7 @@ jobs:
         run: uv sync --extra dev
 
       - name: Ruff lint
-        run: uv run ruff check plugins dags tests
+        run: uv run ruff check plugins dags tests agent
 
   test:
     runs-on: ubuntu-latest
@@ -83,6 +83,7 @@ jobs:
               "branch_on_quality",
               "load_to_warehouse_task",
               "quarantine_task",
+              "investigate_if_quarantined",
           }
           actual_tasks = {t.task_id for t in dag.tasks}
           missing = expected_tasks - actual_tasks
@@ -99,3 +100,19 @@ jobs:
 
       - name: Validate docker-compose.yml
         run: docker compose -f docker-compose.yml config > /dev/null
+
+  agent-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Run agent unit tests (stubs Groq + Postgres — no live infra needed)
+        run: uv run pytest tests/test_agent_investigator.py tests/test_agent_reporters.py tests/test_agent_tools.py -v

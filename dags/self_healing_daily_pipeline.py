@@ -50,10 +50,15 @@ from io import StringIO
 
 import pandas as pd
 from airflow.decorators import dag, task
+from airflow.exceptions import AirflowSkipException
 from airflow.models import Variable
 from airflow.operators.python import get_current_context
 from airflow.providers.slack.notifications.slack import send_slack_notification
 
+from agent.config import AgentConfig
+from agent.investigator import investigate
+from agent.reporters import markdown_reporter, slack_reporter
+from agent.tools import get_quarantine_summary
 from alerts.slack_alerts import build_quarantine_alert_blocks
 from checks.quality_gate import ValidationReport, run_quality_gate
 from load.postgres_loader import (
@@ -216,6 +221,40 @@ def self_healing_daily_pipeline():
             logger.warning("Slack alert failed (non-fatal): %s", e)
         logger.info("Quarantined %d rows for %s", len(df), ds)
 
+    @task(trigger_rule="all_done")
+    def investigate_if_quarantined(ds: str) -> None:
+        """LLM-powered root-cause investigation, triggered after every run.
+
+        trigger_rule="all_done" ensures this task fires regardless of which
+        branch executed — a "successful" DAG run can still contain quarantined
+        data worth investigating.
+
+        Pre-check: if nothing was quarantined for this date, skip immediately
+        so the Groq API is never called on clean runs.
+        """
+        cfg = AgentConfig.from_env()
+
+        summary = get_quarantine_summary(cfg, ds)
+        if summary["total_quarantined"] == 0:
+            raise AirflowSkipException(f"No quarantined records for {ds} — nothing to investigate.")
+
+        verdict = investigate(cfg, dag_id="self_healing_daily_pipeline", run_date=ds)
+        report_path = markdown_reporter.write(
+            verdict, "self_healing_daily_pipeline", ds, cfg.reports_dir
+        )
+        logger.info("Investigation verdict for %s: %s (confidence=%s)", ds, verdict.get("root_cause"), verdict.get("confidence"))
+
+        if cfg.slack_webhook_url:
+            try:
+                slack_reporter.post(
+                    cfg.slack_webhook_url, verdict, "self_healing_daily_pipeline", ds,
+                    report_url=report_path,
+                )
+            except Exception as e:
+                logger.warning("Agent Slack report failed (non-fatal): %s", e)
+
+        logger.info("Investigation complete for %s -> %s", ds, report_path)
+
     # -----------------------------------------------------------------
     # DAG wiring
     # -----------------------------------------------------------------
@@ -233,6 +272,11 @@ def self_healing_daily_pipeline():
     # Only one of these two tasks will actually execute per run;
     # the other is skipped by branch_on_quality.
     branch >> [warehouse_t, quarantine_t]
+
+    # investigate_if_quarantined runs after both load paths regardless of
+    # outcome (trigger_rule="all_done"). It skips itself on clean runs.
+    investigation = investigate_if_quarantined(ds="{{ ds }}")
+    [warehouse_t, quarantine_t] >> investigation
 
 
 self_healing_daily_pipeline()

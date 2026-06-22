@@ -1,0 +1,9 @@
+{
+  "expected_keys": [
+    "time",
+    "temperature_2m",
+    "relative_humidity_2m",
+    "wind_speed_10m",
+    "precipitation"
+  ]
+}

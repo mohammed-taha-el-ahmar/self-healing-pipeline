@@ -48,10 +48,25 @@ docker compose exec airflow-scheduler airflow dags unpause self_healing_daily_pi
 docker compose exec airflow-scheduler \
   airflow dags trigger self_healing_daily_pipeline --exec-date 2026-06-15
 
-# Backfill a date range (catchup must be True on the DAG)
+# Backfill a date range for dates that have NO existing runs yet
 docker compose exec airflow-scheduler \
   airflow dags backfill self_healing_daily_pipeline -s 2026-06-08 -e 2026-06-12
+
+# Re-run dates that ALREADY have runs (e.g. to replay with a fix):
+# 1. Pause so the scheduler stops claiming max_active_runs slots
+docker compose exec airflow-scheduler airflow dags pause self_healing_daily_pipeline
+# 2. Backfill with --reset-dagruns to overwrite existing run records
+docker compose exec airflow-scheduler \
+  airflow dags backfill self_healing_daily_pipeline -s 2026-06-08 -e 2026-06-12 \
+  --reset-dagruns
+# 3. Unpause when done
+docker compose exec airflow-scheduler airflow dags unpause self_healing_daily_pipeline
 ```
+
+> **Why does backfill hang?** The DAG has `max_active_runs=3`. If the
+> scheduler already occupies all 3 slots with its own catchup/scheduled
+> runs, a backfill CLI call waits indefinitely for a free slot. Pausing
+> the DAG first releases those slots to the backfill.
 
 ### Inspecting Runs
 
